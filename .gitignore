@@ -1,2 +1,6 @@
-# Project exclude paths
-/cmake-build-release/
+cmake-build-*/
+build/
+.idea/
+*.exe
+*.o
+*.obj
