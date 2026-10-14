@@ -93,10 +93,21 @@ struct Photo {
     std::string downloadPath; // path on api.unsplash.com used to register the download
 };
 
+//pool of search query
+std::vector<std::string> categories = {"cars", "anime", "hacking", "animal", "people", "tech", "game"};
+
+//setup random number generator
+std::random_device rd;
+std::mt19937 gen(rd());
+std::uniform_int_distribution<> distr(0, categories.size() -1);
+
+//select random category
+std::string randomQuery = categories[distr(gen)];
+
 Photo fetchUnsplashPhoto(const std::string& accessKey) {
     std::string headers = "Authorization: Client-ID " + accessKey + "\r\nAccept-Version: v1\r\n";
     std::string json = httpGet("api.unsplash.com",
-        "/photos/random?orientation=landscape&query=landscape+nature&content_filter=high",
+        "/photos/random?orientation=landscape&query=" + randomQuery,
         headers);
 
     Photo p;
