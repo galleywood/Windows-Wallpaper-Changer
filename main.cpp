@@ -1,11 +1,18 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <urlmon.h>
+#include <shlobj.h>
 #include <string>
 #include <vector>
 #include <random>
 #include <filesystem>
 #include <ctime>
+
+// Ensure Shell32 and Ole32 are linked alongside Winhttp and Urlmon
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "urlmon.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 
 namespace fs = std::filesystem;
 
@@ -74,7 +81,7 @@ std::string replaceAll(std::string s, const std::string& from, const std::string
     return s;
 }
 
-// First  "key":"value"  in the JSON, with JSON escapes undone
+// First "key":"value" in the JSON, with JSON escapes undone
 std::string extractFirst(const std::string& json, const std::string& key) {
     std::string needle = "\"" + key + "\":\"";
     size_t pos = json.find(needle);
@@ -93,18 +100,12 @@ struct Photo {
     std::string downloadPath; // path on api.unsplash.com used to register the download
 };
 
-//pool of search query
-std::vector<std::string> categories = {"cars", "anime", "hacking", "animal", "people", "tech", "game"};
-
-//setup random number generator
-std::random_device rd;
-std::mt19937 gen(rd());
-std::uniform_int_distribution<> distr(0, categories.size() -1);
-
-//select random category
-std::string randomQuery = categories[distr(gen)];
+// Pool of search queries
+const std::vector<std::string> categories = {"cars", "anime", "hacking", "animal", "tech", "game", "linux"};
 
 Photo fetchUnsplashPhoto(const std::string& accessKey) {
+    std::string randomQuery = categories[getRandomInt(0, (int)categories.size() - 1)];
+
     std::string headers = "Authorization: Client-ID " + accessKey + "\r\nAccept-Version: v1\r\n";
     std::string json = httpGet("api.unsplash.com",
         "/photos/random?orientation=landscape&query=" + randomQuery,
@@ -123,23 +124,52 @@ Photo fetchUnsplashPhoto(const std::string& accessKey) {
     return p;
 }
 
+// Dynamically resolves Pictures\SavedWallpapers even when redirected by OneDrive
+fs::path getSavedWallpapersDir() {
+    PWSTR pszPath = nullptr;
+    fs::path folderPath;
+
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Pictures, 0, nullptr, &pszPath))) {
+        folderPath = pszPath;
+        CoTaskMemFree(pszPath);
+    } else {
+        wchar_t userProfile[MAX_PATH];
+        if (GetEnvironmentVariableW(L"USERPROFILE", userProfile, MAX_PATH) > 0) {
+            folderPath = fs::path(userProfile) / L"Pictures";
+        }
+    }
+
+    folderPath /= L"SavedWallpapers";
+
+    std::error_code ec;
+    fs::create_directories(folderPath, ec); // Creates parent folders if missing, never throws
+    return folderPath;
+}
+
+// Checks that a file is physically present on disk and not an unhydrated OneDrive cloud stub
+bool isFileAvailableOffline(const fs::path& p) {
+    DWORD attrs = GetFileAttributesW(p.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return false;
+
+    const DWORD cloudStubFlags = FILE_ATTRIBUTE_OFFLINE |
+                                 FILE_ATTRIBUTE_RECALL_ON_OPEN |
+                                 FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+    return (attrs & cloudStubFlags) == 0;
+}
+
 int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-    char userProfile[MAX_PATH];
-    GetEnvironmentVariableA("USERPROFILE", userProfile, MAX_PATH);
-
-    std::string folderPath = std::string(userProfile) + "\\Pictures\\SavedWallpapers";
-    CreateDirectoryA(folderPath.c_str(), NULL);
-
-    std::string savePath = folderPath + "\\wallpaper_" + std::to_string(std::time(nullptr)) + ".jpg";
+    fs::path folderPath = getSavedWallpapersDir();
+    fs::path savePath = folderPath / (L"wallpaper_" + std::to_wstring(std::time(nullptr)) + L".jpg");
 
     bool downloaded = false;
     char key[256];
     if (GetEnvironmentVariableA("UNSPLASH_ACCESS_KEY", key, sizeof(key)) > 0) {
         Photo photo = fetchUnsplashPhoto(key);
         if (!photo.imageUrl.empty()) {
-            downloaded = (URLDownloadToFileA(NULL, photo.imageUrl.c_str(), savePath.c_str(), 0, NULL) == S_OK);
+            std::wstring wUrl = widen(photo.imageUrl);
+            downloaded = (URLDownloadToFileW(nullptr, wUrl.c_str(), savePath.c_str(), 0, nullptr) == S_OK);
             if (!downloaded) {
-                DeleteFileA(savePath.c_str());
+                DeleteFileW(savePath.c_str());
             } else if (!photo.downloadPath.empty()) {
                 // Unsplash guideline: register the download once the photo is actually used
                 httpGet("api.unsplash.com", photo.downloadPath,
@@ -148,20 +178,25 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
     }
 
-    std::string finalWallpaperPath = savePath;
+    fs::path finalWallpaperPath = savePath;
 
-    // Offline fallback: reuse a previously saved wallpaper
+    // Offline fallback: reuse a previously saved local wallpaper
     if (!downloaded) {
-        std::vector<std::string> savedFiles;
-        for (const auto& entry : fs::directory_iterator(folderPath)) {
-            auto ext = entry.path().extension();
-            if (ext == ".jpg" || ext == ".png") savedFiles.push_back(entry.path().string());
+        std::vector<fs::path> savedFiles;
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(folderPath, ec)) {
+            if (entry.is_regular_file(ec)) {
+                auto ext = entry.path().extension();
+                if ((ext == L".jpg" || ext == L".png") && isFileAvailableOffline(entry.path())) {
+                    savedFiles.push_back(entry.path());
+                }
+            }
         }
         if (savedFiles.empty()) return 0;
         finalWallpaperPath = savedFiles[getRandomInt(0, (int)savedFiles.size() - 1)];
     }
 
-    SystemParametersInfoA(SPI_SETDESKWALLPAPER, 0, (PVOID)finalWallpaperPath.c_str(),
+    SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, (PVOID)finalWallpaperPath.c_str(),
                           SPIF_UPDATEINIFILE | SPIF_SENDWININICHANGE);
     return 0;
 }
